@@ -1,0 +1,15 @@
+﻿ui/node_modules/
+ui/.next/
+__pycache__/
+*.pyc
+knowledge/__pycache__/
+knowledge/asvs/__pycache__/
+knowledge/masvs/__pycache__/
+tools/__pycache__/
+.env
+evidence/*
+!evidence/.gitkeep
+reports/*
+!reports/.gitkeep
+sessions/*
+!sessions/.gitkeep

@@ -1,0 +1,680 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ModTester — AI Penetration Testing Platform (UI)
+  ECS deployment for Next.js UI with Application Load Balancer
+
+Parameters:
+  CustomerName:
+    Type: String
+    Description: "Name of the customer/project"
+    Default: "modtester-ui"
+    AllowedPattern: ".+"
+  
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: "Environment name (dev, staging, prod)"
+    AllowedPattern: "^[0-9a-zA-Z-/]*$"
+  
+  ECSClusterName:
+    Type: String
+    Description: "Name of the existing ECS cluster to deploy to"
+    Default: "modtester-dev"
+  
+  BackendAPIURL:
+    Type: String
+    Description: "URL of the backend API service (e.g., https://api.vpc.local)"
+    Default: "http://localhost:8000"
+  
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: "VPC ID where the UI will be deployed"
+  
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Private Subnet 1 ID"
+  
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Private Subnet 2 ID"
+  
+  ContainerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: "Security Group ID of the existing ECS container instances"
+  
+  ImageTag:
+    Type: String
+    Description: "Docker image tag"
+    Default: latest
+    AllowedPattern: ".+"
+  
+  DesiredTaskCount:
+    Type: Number
+    Default: 0
+    Description: "Number of ECS tasks to run (set to 0 for first deploy, pipeline will scale up)"
+  
+  CertificateArn:
+    Type: String
+    Description: "ARN of ACM certificate for HTTPS (leave empty to create self-signed certificate)"
+    Default: ""
+  
+  LocalDomainName:
+    Type: String
+    Description: "Local domain name for the VPC (e.g., mycompany.local)"
+    Default: "vpc.local"
+  
+  PrivateHostedZoneId:
+    Type: String
+    Description: "ID of existing Route53 Private Hosted Zone (leave empty to skip DNS record creation)"
+    Default: ""
+  
+  GitHubRepo:
+    Type: String
+    Description: "GitHub repository name (e.g., username/repo)"
+    Default: ""
+  
+  GitHubBranch:
+    Type: String
+    Description: "GitHub branch to track"
+    Default: "main"
+  
+  GitHubConnectionArn:
+    Type: String
+    Description: "ARN of CodeStar Connection for GitHub (leave empty to skip pipeline creation)"
+    Default: ""
+
+Conditions:
+  UseHTTPS: !Not [!Equals [!Ref CertificateArn, ""]]
+  CreateDNSRecord: !Not [!Equals [!Ref PrivateHostedZoneId, ""]]
+  CreatePipeline: !And
+    - !Not [!Equals [!Ref GitHubRepo, ""]]
+    - !Not [!Equals [!Ref GitHubConnectionArn, ""]]
+
+Resources:
+  # =========================================================================
+  # DNS Record for Internal Load Balancer
+  # =========================================================================
+  LoadBalancerDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateDNSRecord
+    DependsOn: LoadBalancer
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZoneId
+      Name: !Sub "ui.${LocalDomainName}"
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        DNSName: !GetAtt LoadBalancer.DNSName
+        EvaluateTargetHealth: true
+
+  # =========================================================================
+  # Security Groups
+  # =========================================================================
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Internal Application Load Balancer (UI)
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/8
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.0.0.0/8
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}-ALB
+
+  ContainerSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ContainerSecurityGroupId
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      Description: Allow traffic from UI ALB
+
+  CodeBuildSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreatePipeline
+    Properties:
+      GroupDescription: Security group for CodeBuild
+      VpcId: !Ref VPCId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}-CodeBuild
+
+  # =========================================================================
+  # IAM Roles
+  # =========================================================================
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt LogGroup.Arn
+                  - !Sub ${LogGroup.Arn}:*
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}-TaskExecution
+
+  ECSServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}-ECSService
+
+  # =========================================================================
+  # ECR Repository
+  # =========================================================================
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep last 10 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 10
+              },
+              "action": { "type": "expire" }
+            }]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}
+
+  # =========================================================================
+  # CloudWatch Logs
+  # =========================================================================
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${CustomerName}-${EnvironmentName}/ui
+      RetentionInDays: 7
+
+  # =========================================================================
+  # ECS Task Definition — Next.js UI
+  # =========================================================================
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${CustomerName}-${EnvironmentName}
+      RequiresCompatibilities:
+        - EC2
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      NetworkMode: bridge
+      ContainerDefinitions:
+        - Name: !Sub ${CustomerName}-${EnvironmentName}
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:${ImageTag}
+          Memory: 512
+          MemoryReservation: 256
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+              HostPort: 0
+              Protocol: tcp
+          Environment:
+            - Name: API_URL
+              Value: !Ref BackendAPIURL
+            - Name: NEXT_PUBLIC_API_URL
+              Value: !Ref BackendAPIURL
+            - Name: NODE_ENV
+              Value: production
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ui
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}
+
+  # =========================================================================
+  # Application Load Balancer (Internal)
+  # =========================================================================
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Type: application
+      Subnets:
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !Ref VPCId
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetType: instance
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - UseHTTPS
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: 443
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: UseHTTPS
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # =========================================================================
+  # ECS Service
+  # =========================================================================
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HTTPListener
+    Properties:
+      Cluster: !Ref ECSClusterName
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredTaskCount
+      LaunchType: EC2
+      LoadBalancers:
+        - ContainerName: !Sub ${CustomerName}-${EnvironmentName}
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroup
+      Role: !Ref ECSServiceRole
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      PlacementStrategies:
+        - Type: spread
+          Field: attribute:ecs.availability-zone
+        - Type: spread
+          Field: instanceId
+
+  # =========================================================================
+  # CI/CD Resources
+  # =========================================================================
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreatePipeline
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}-artifacts
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Condition: CreatePipeline
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource: !Ref GitHubConnectionArn
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}-CodePipeline
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Condition: CreatePipeline
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt CodeBuildLogGroup.Arn
+                  - !Sub ${CodeBuildLogGroup.Arn}:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeTaskDefinition
+                  - ecs:ListClusters
+                  - ecs:ListServices
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeVpcs
+                  - ec2:CreateNetworkInterfacePermission
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}-CodeBuild
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreatePipeline
+    Properties:
+      RetentionInDays: 7
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Condition: CreatePipeline
+    Properties:
+      Description: Build Docker image for ModTester Next.js UI and push to ECR
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref ECRRepository
+          - Name: IMAGE_TAG
+            Value: latest
+          - Name: CUSTOMER_NAME
+            Value: !Ref CustomerName
+          - Name: ENV_NAME
+            Value: !Ref EnvironmentName
+          - Name: API_URL
+            Value: !Ref BackendAPIURL
+      VpcConfig:
+        VpcId: !Ref VPCId
+        Subnets:
+          - !Ref PrivateSubnetOne
+          - !Ref PrivateSubnetTwo
+        SecurityGroupIds:
+          - !Ref CodeBuildSecurityGroup
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-ui.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: CreatePipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              Configuration:
+                ClusterName: !Ref ECSClusterName
+                ServiceName: !GetAtt ECSService.Name
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: BuildOutput
+      Tags:
+        - Key: Name
+          Value: !Sub ${CustomerName}-${EnvironmentName}
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS name of the UI load balancer
+    Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub ${CustomerName}-${EnvironmentName}-LoadBalancerDNS
+  
+  LoadBalancerURL:
+    Description: URL of the UI load balancer
+    Value: !Sub 
+      - ${Protocol}://${DNS}
+      - Protocol: !If [UseHTTPS, https, http]
+        DNS: !GetAtt LoadBalancer.DNSName
+  
+  LoadBalancerPrivateDNS:
+    Condition: CreateDNSRecord
+    Description: Private DNS name for the UI load balancer
+    Value: !Sub "ui.${LocalDomainName}"
+    Export:
+      Name: !Sub ${CustomerName}-${EnvironmentName}-LoadBalancerPrivateDNS
+  
+  LoadBalancerPrivateURL:
+    Condition: CreateDNSRecord
+    Description: HTTPS URL for the UI load balancer
+    Value: !Sub "https://ui.${LocalDomainName}"
+    Export:
+      Name: !Sub ${CustomerName}-${EnvironmentName}-LoadBalancerPrivateURL
+  
+  ECRRepositoryURI:
+    Description: URI of the ECR repository
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Export:
+      Name: !Sub ${CustomerName}-${EnvironmentName}-ECRRepositoryURI
+  
+  ECSServiceName:
+    Description: Name of the ECS service
+    Value: !GetAtt ECSService.Name
+    Export:
+      Name: !Sub ${CustomerName}-${EnvironmentName}-ECSService
+  
+  PipelineName:
+    Condition: CreatePipeline
+    Description: Name of the CodePipeline
+    Value: !Ref Pipeline
+    Export:
+      Name: !Sub ${CustomerName}-${EnvironmentName}-Pipeline
+  
+  PipelineUrl:
+    Condition: CreatePipeline
+    Description: URL of the CodePipeline
+    Value: !Sub https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view
+  
+  CodeBuildProjectName:
+    Condition: CreatePipeline
+    Description: Name of the CodeBuild project
+    Value: !Ref CodeBuildProject
+    Export:
+      Name: !Sub ${CustomerName}-${EnvironmentName}-CodeBuild
+  
+  ArtifactBucketName:
+    Condition: CreatePipeline
+    Description: Name of the S3 artifact bucket
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub ${CustomerName}-${EnvironmentName}-ArtifactBucket

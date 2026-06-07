@@ -1,0 +1,92 @@
+services:
+  # ---------------------------------------------------------------------------
+  # DynamoDB Local — persistence for assessments, chat, reports
+  # ---------------------------------------------------------------------------
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: modtester-dynamodb
+    user: root
+    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath /data"
+    ports:
+      - "4002:8000"
+    volumes:
+      - dynamodb-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://localhost:8000 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # MCP Security Tool Server
+  # ---------------------------------------------------------------------------
+  mcp-security:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-offsec-demo
+    depends_on:
+      dynamodb-local:
+        condition: service_healthy
+    ports:
+      - "4001:8000"
+    env_file: .env
+    environment:
+      - MCP_PORT=8000
+      - AI_BACKEND=${AI_BACKEND:-bedrock}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - BEDROCK_MODEL=${BEDROCK_MODEL:-us.anthropic.claude-opus-4-5-20251101-v1:0}
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1:70b}
+      - SHOW_TOOL_NAMES=false
+      - DYNAMODB_ENDPOINT=http://dynamodb-local:8000
+      - DYNAMODB_TABLE_PREFIX=modtester_
+      - SEED_DB=true
+    volumes:
+      - ./reports:/app/reports
+      - ./sessions:/app/sessions
+      - ./evidence:/app/evidence
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # ModTester Web UI (Next.js)
+  # ---------------------------------------------------------------------------
+  modtester-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    container_name: modtester-ui
+    depends_on:
+      mcp-security:
+        condition: service_healthy
+    expose:
+      - "3000"
+    environment:
+      - API_URL=http://mcp-security:8000
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Nginx Reverse Proxy — single entrypoint, streams SSE properly
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: modtester-nginx
+    depends_on:
+      - modtester-ui
+      - mcp-security
+    ports:
+      - "4000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+
+volumes:
+  dynamodb-data:

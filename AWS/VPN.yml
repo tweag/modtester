@@ -1,0 +1,365 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy Softether on Amazon EC2
+
+Parameters:
+  LatestAmiId :
+    Type : 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
+  NameBurtualHubVPN:
+    Type: String
+    Description: HUB Name Softether VPN.
+  EC2InstanceType:
+    Type: String
+    Description: EC2 instance type for the Softether VPN.
+    Default: t3a.medium
+  IPsecPreSharedKey:
+    Type: String
+    NoEcho: true
+    Description: Ipsec Pre-shared Key.
+  SubnetIdPublicSoftether:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet where the Softether will be deployed need to be Public.
+  SoftetherPassword:
+    Description: "Password for Softether. Must be between 8 and 64 characters and contain at least one uppercase letter, one lowercase letter, one number, and one of the following symbols: .*+?-"
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    AllowedPattern: "^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[.*+?-]).{8,64}$"
+    
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the EC2 instance will be deployed
+
+  VPNUsername:
+    Type: String
+    Description: "Default VPN user account name"
+    Default: "modtester"
+    MinLength: 3
+    MaxLength: 32
+
+  VPNUserPassword:
+    Type: String
+    NoEcho: true
+    Description: "Password for the default VPN user"
+    Default: "ModTester@2026!"
+
+  LocalDomainName:
+    Type: String
+    Description: "Local domain name for VPN DNS configuration"
+    Default: "vpc.local"
+
+Resources:
+  # S3 Bucket for VPN config files
+  VPNConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpn-configs
+
+  SoftetherInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SoftetherRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3VPNConfigUpload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${VPNConfigBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt VPNConfigBucket.Arn
+      Path: /
+  SoftetherInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName: SoftetherInstanceProfile
+      Roles:
+        - !Ref SoftetherInstanceRole
+
+  SoftetherNetworkInterface1:
+    Type: "AWS::EC2::NetworkInterface"
+    Properties:
+      Description: "Additional Network Interface 1"
+      GroupSet:
+        - !Ref SecurityGroup # Security Group ID
+      SubnetId: !Ref SubnetIdPublicSoftether # Subnet ID
+      Tags:
+        - Key: Name
+          Value: "Softether"
+  SoftetherInstance:
+    Type: 'AWS::EC2::Instance'
+    DependsOn: 
+      - SoftetherNetworkInterface1
+      - VPNConfigBucket
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref SoftetherInstanceProfile
+      NetworkInterfaces:
+        - 
+          DeviceIndex: 1
+          GroupSet:
+            - !Ref SecurityGroup # Security Group ID
+          SubnetId: !Ref SubnetIdPublicSoftether # Subnet ID of the primary interface
+        - 
+          DeviceIndex: 0
+          NetworkInterfaceId: !Ref SoftetherNetworkInterface1
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -x
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          # Install CloudFormation helper scripts
+          yum install -y aws-cfn-bootstrap
+          
+          # Habilitar IP Forwarding
+          echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+          sysctl -p 
+          
+          # Continuar con la instalación de Development Tools, etc.
+          yum -y groupinstall "Development Tools"
+          yum -y update
+          
+          # softether version 4.44
+          cd /usr/local/
+          wget https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.44-9807-rtm/softether-vpnserver-v4.44-9807-rtm-2025.04.16-linux-x64-64bit.tar.gz
+          tar xvf softether-vpnserver-*
+          rm -rf softether-vpnserver-*
+          cd vpnserver
+          
+          # Accept license automatically
+          yes 1 | make
+          
+          cat > /etc/init.d/vpnserver << 'VPNEOF'
+          #!/bin/sh
+          # chkconfig: 2345 99 01
+          # description: SoftEther VPN Server
+          DAEMON=/usr/local/vpnserver/vpnserver
+          LOCK=/var/lock/subsys/vpnserver
+          test -x $DAEMON || exit 0
+          case "$1" in
+          start)
+          $DAEMON start
+          touch $LOCK
+          ;;
+          stop)
+          $DAEMON stop
+          rm $LOCK
+          ;;
+          restart)
+          $DAEMON stop
+          sleep 3
+          $DAEMON start
+          ;;
+          *)
+          echo "Usage: $0 {start|stop|restart}"
+          exit 1
+          esac
+          exit 0
+          VPNEOF
+          chmod 755 /etc/init.d/vpnserver
+          /etc/init.d/vpnserver start
+          chkconfig --add vpnserver 
+          
+          # Wait for VPN server to be ready
+          sleep 5
+          
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"" /CMD ServerPasswordSet ${SoftetherPassword}
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB DEFAULT /CMD HubDelete DEFAULT
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /CMD HubCreate "${NameBurtualHubVPN}" /PASSWORD:"${SoftetherPassword}"
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB "${NameBurtualHubVPN}" /CMD IPsecEnable /L2TP:yes /L2TPRAW:yes /ETHERIP:yes /PSK:${IPsecPreSharedKey} /DEFAULTHUB:"${NameBurtualHubVPN}"         
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD SecureNatEnable
+          
+          sleep 5
+
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD DhcpSet /START:192.168.30.10 /END:192.168.30.200 /MASK:255.255.255.0 /EXPIRE:86400 /GW:192.168.30.1 /DNS2:8.8.8.8 /DOMAIN:${LocalDomainName} /LOG:yes /PUSHROUTE:10.0.3.0/255.255.255.0/192.168.30.1
+          
+          # Create default VPN user
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD UserCreate ${VPNUsername} /GROUP:none /REALNAME:none /NOTE:none
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /HUB:"${NameBurtualHubVPN}" /CMD UserPasswordSet ${VPNUsername} /PASSWORD:"${VPNUserPassword}"
+          
+          # Enable OpenVPN compatible server
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /CMD OpenVpnEnable yes /PORTS:1194
+          /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}" /CMD ServerCipherSet ECDHE-RSA-AES256-GCM-SHA384
+          
+          # Generate OpenVPN config file
+          cd /tmp
+          printf "OpenVpnMakeConfig\n/tmp/openvpn_config.zip\n" | /usr/local/vpnserver/vpncmd localhost /SERVER /PASSWORD:"${SoftetherPassword}"
+          
+          # Find the generated zip file
+          OVPN_ZIP="/tmp/openvpn_config.zip"
+          
+          if [ -f "$OVPN_ZIP" ]; then
+            unzip -o "$OVPN_ZIP" -d /tmp/openvpn_configs/
+          fi
+          
+          # Get the public IP for the config
+          PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+          
+          # Generate a self-signed client certificate and private key
+          openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+            -subj "/CN=${VPNUsername}-client" \
+            -keyout /tmp/client.key \
+            -out /tmp/client.crt 2>/dev/null
+          
+          # Create a clean OpenVPN config file
+          cat > /tmp/modtester-vpn.ovpn << OVPNEOF
+          ###############################################
+          # ModTester VPN - OpenVPN Configuration
+          # Server: $PUBLIC_IP
+          # Hub: ${NameBurtualHubVPN}
+          # User: ${VPNUsername}
+          ###############################################
+          dev tun
+          proto udp
+          remote $PUBLIC_IP 1194
+          cipher AES-256-CBC
+          auth SHA256
+          resolv-retry infinite
+          nobind
+          persist-key
+          persist-tun
+          client
+          verb 3
+          auth-user-pass
+          OVPNEOF
+          
+          # Append CA from the generated Softether config
+          OVPN_FILE=$(ls /tmp/openvpn_configs/*_openvpn_remote_access_l3.ovpn 2>/dev/null | head -1)
+          if [ -n "$OVPN_FILE" ]; then
+            sed -n '/<ca>/,/<\/ca>/p' "$OVPN_FILE" >> /tmp/modtester-vpn.ovpn
+          fi
+          
+          # Append client certificate
+          echo "<cert>" >> /tmp/modtester-vpn.ovpn
+          cat /tmp/client.crt >> /tmp/modtester-vpn.ovpn
+          echo "</cert>" >> /tmp/modtester-vpn.ovpn
+          
+          # Append client private key
+          echo "<key>" >> /tmp/modtester-vpn.ovpn
+          cat /tmp/client.key >> /tmp/modtester-vpn.ovpn
+          echo "</key>" >> /tmp/modtester-vpn.ovpn
+          
+          
+          # Upload to S3
+          BUCKET_NAME="${VPNConfigBucket}"
+          
+          if [ -n "$BUCKET_NAME" ]; then
+            aws s3 cp /tmp/modtester-vpn.ovpn "s3://$BUCKET_NAME/openvpn/${NameBurtualHubVPN}-${VPNUsername}.ovpn" --region ${AWS::Region}
+            if [ -f "$OVPN_ZIP" ]; then
+              aws s3 cp "$OVPN_ZIP" "s3://$BUCKET_NAME/openvpn/softether-full-config.zip" --region ${AWS::Region}
+            fi
+            echo "OpenVPN config uploaded to s3://$BUCKET_NAME/openvpn/"
+          fi
+          
+          echo "Configuración de SoftEther VPN completada."
+          
+          # Send success signal
+          /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource SoftetherInstance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: Softether
+    CreationPolicy:
+        ResourceSignal:
+          Timeout: PT10M
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc 
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      NetworkInterfaceId: !Ref SoftetherNetworkInterface1
+  SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Ports for Softether connection
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 4500
+          ToPort: 4500
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 1701
+          ToPort: 1701
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 500
+          ToPort: 500
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 3500
+          ToPort: 3500
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 1194
+          ToPort: 1194
+          CidrIp: 0.0.0.0/0
+  InstanceSecurityGroupIngress:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+       
+      
+Outputs:
+  IPSoftether:
+    Description: Ip of the VPN
+    Value: !Sub "${EIP.PublicIp}"
+
+  VPNUsername:
+    Description: Default VPN username
+    Value: !Ref VPNUsername
+
+  VPNConnectionInfo:
+    Description: VPN connection details
+    Value: !Sub "Server: ${EIP.PublicIp} | Hub: ${NameBurtualHubVPN} | User: ${VPNUsername}"
+
+  OpenVPNConfigS3:
+    Description: S3 path to download the OpenVPN config file
+    Value: !Sub "s3://${VPNConfigBucket}/openvpn/${NameBurtualHubVPN}-${VPNUsername}.ovpn"
+
+  VPNConfigBucketName:
+    Description: S3 bucket for VPN configs
+    Value: !Ref VPNConfigBucket
+

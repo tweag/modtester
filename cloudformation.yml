@@ -1,0 +1,690 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ModTester — AI Penetration Testing Platform
+  AWS Summit DC Demo Stack
+  Deploys: VPC, ECS/Fargate (backend + UI), DynamoDB, ALB, CloudWatch
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: modtester-demo
+    Description: Environment name prefix for resources
+
+  BackendImage:
+    Type: String
+    Description: ECR image URI for the MCP security backend
+
+  UIImage:
+    Type: String
+    Description: ECR image URI for the Next.js UI
+
+  BedrockModel:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-20250514-v1:0
+    Description: Bedrock model ID (Sonnet 4 default, Opus 4 for production)
+
+  AuthSecret:
+    Type: String
+    NoEcho: true
+    Description: JWT signing secret
+
+  DemoPassword:
+    Type: String
+    NoEcho: true
+    Description: Demo user password
+
+  VPNServerCertArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN for Client VPN server auth (leave empty to skip VPN)
+
+  VPNClientCidr:
+    Type: String
+    Default: 10.200.0.0/16
+    Description: CIDR for VPN client IP allocation
+
+Conditions:
+  DeployVPN: !Not [!Equals [!Ref VPNServerCertArn, '']]
+
+Resources:
+  # =========================================================================
+  # VPC
+  # =========================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-2
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # =========================================================================
+  # SECURITY GROUPS
+  # =========================================================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  # =========================================================================
+  # KMS — Encryption at rest for all data
+  # =========================================================================
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub ${EnvironmentName} encryption key for DynamoDB, S3, and CloudWatch
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowECSTaskRole
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ECSTaskRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${EnvironmentName}-key
+      TargetKeyId: !Ref EncryptionKey
+
+  # =========================================================================
+  # S3 — Evidence & report storage (encrypted)
+  # =========================================================================
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-evidence-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EncryptionKey
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: RetainEvidenceForOneYear
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 365
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: security-evidence
+
+  # =========================================================================
+  # DYNAMODB
+  # =========================================================================
+  AssessmentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${EnvironmentName}_assessments
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  ChatHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${EnvironmentName}_chat_history
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      AttributeDefinitions:
+        - AttributeName: assessment_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: assessment_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+
+  ReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${EnvironmentName}_reports
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      AttributeDefinitions:
+        - AttributeName: assessment_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: assessment_id
+          KeyType: HASH
+        - AttributeName: created_at
+          KeyType: RANGE
+
+  # =========================================================================
+  # ECS CLUSTER
+  # =========================================================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${EnvironmentName}-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # =========================================================================
+  # IAM
+  # =========================================================================
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: modtester-task-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:ListTables
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:DescribeTable
+                  - dynamodb:CreateTable
+                Resource:
+                  - !GetAtt AssessmentsTable.Arn
+                  - !Sub ${AssessmentsTable.Arn}/index/*
+                  - !GetAtt ChatHistoryTable.Arn
+                  - !GetAtt ReportsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt EvidenceBucket.Arn
+                  - !Sub ${EvidenceBucket.Arn}/*
+
+  # =========================================================================
+  # ALB
+  # =========================================================================
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-alb
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultAction:
+        Type: forward
+        TargetGroupArn: !Ref UITargetGroup
+
+  UITargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-ui-tg
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-api-tg
+      Port: 8000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+
+  APIListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/*
+            - /health
+            - /tools
+            - /mcp/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  # =========================================================================
+  # LOG GROUPS
+  # =========================================================================
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}/backend
+      RetentionInDays: 7
+
+  UILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}/ui
+      RetentionInDays: 7
+
+  # =========================================================================
+  # ECS TASK DEFINITIONS
+  # =========================================================================
+  BackendTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-backend
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '2048'
+      Memory: '8192'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImage
+          PortMappings:
+            - ContainerPort: 8000
+          Environment:
+            - Name: MCP_PORT
+              Value: '8000'
+            - Name: AI_BACKEND
+              Value: bedrock
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: BEDROCK_MODEL
+              Value: !Ref BedrockModel
+            - Name: DYNAMODB_ENDPOINT
+              Value: ''
+            - Name: DYNAMODB_TABLE_PREFIX
+              Value: !Sub ${EnvironmentName}_
+            - Name: AUTH_SECRET
+              Value: !Ref AuthSecret
+            - Name: MODTESTER_PASS
+              Value: !Ref DemoPassword
+            - Name: SEED_DB
+              Value: 'true'
+            - Name: EVIDENCE_S3_BUCKET
+              Value: !Ref EvidenceBucket
+            - Name: EVIDENCE_S3_PREFIX
+              Value: evidence/
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+
+  UITaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-ui
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: ui
+          Image: !Ref UIImage
+          PortMappings:
+            - ContainerPort: 3000
+          Environment:
+            - Name: NEXT_PUBLIC_API_URL
+              Value: !Sub http://${ALB.DNSName}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref UILogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ui
+
+  # =========================================================================
+  # ECS SERVICES
+  # =========================================================================
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn: APIListenerRule
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 8000
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  UIService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref UITaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: ui
+          ContainerPort: 3000
+          TargetGroupArn: !Ref UITargetGroup
+
+  # =========================================================================
+  # CLIENT VPN (conditional — only if VPNServerCertArn is provided)
+  # =========================================================================
+  VPNLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployVPN
+    Properties:
+      LogGroupName: !Sub /aws/vpn/${EnvironmentName}
+      RetentionInDays: 7
+
+  VPNSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployVPN
+    Properties:
+      GroupDescription: Client VPN endpoint security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  ClientVPNEndpoint:
+    Type: AWS::EC2::ClientVpnEndpoint
+    Condition: DeployVPN
+    Properties:
+      Description: !Sub ${EnvironmentName} Client VPN
+      AuthenticationOptions:
+        - Type: certificate-authentication
+          MutualAuthentication:
+            ClientRootCertificateChainArn: !Ref VPNServerCertArn
+      ConnectionLogOptions:
+        Enabled: true
+        CloudwatchLogGroup: !Ref VPNLogGroup
+      ClientCidrBlock: !Ref VPNClientCidr
+      ServerCertificateArn: !Ref VPNServerCertArn
+      VpcId: !Ref VPC
+      SecurityGroupIds:
+        - !Ref VPNSecurityGroup
+      SplitTunnel: true
+      TransportProtocol: udp
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpn
+
+  VPNTargetNetworkAssoc:
+    Type: AWS::EC2::ClientVpnTargetNetworkAssociation
+    Condition: DeployVPN
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVPNEndpoint
+      SubnetId: !Ref PrivateSubnet1
+
+  VPNAuthRule:
+    Type: AWS::EC2::ClientVpnAuthorizationRule
+    Condition: DeployVPN
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVPNEndpoint
+      TargetNetworkCidr: 10.0.0.0/16
+      AuthorizeAllGroups: true
+
+Outputs:
+  ALBURL:
+    Description: Application URL
+    Value: !Sub http://${ALB.DNSName}
+  BackendURL:
+    Description: Backend API URL
+    Value: !Sub http://${ALB.DNSName}/api
+  ClusterName:
+    Description: ECS Cluster
+    Value: !Ref ECSCluster
+  EvidenceBucketName:
+    Description: S3 bucket for evidence storage (KMS encrypted)
+    Value: !Ref EvidenceBucket
+  KMSKeyArn:
+    Description: KMS key ARN for encryption at rest
+    Value: !GetAtt EncryptionKey.Arn
+  VPNEndpointId:
+    Condition: DeployVPN
+    Description: Client VPN Endpoint ID
+    Value: !Ref ClientVPNEndpoint

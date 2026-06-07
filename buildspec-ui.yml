@@ -1,0 +1,42 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - echo Repository URI is $REPOSITORY_URI
+      - echo Image tag is $IMAGE_TAG
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Building the ModTester Next.js UI Docker image...
+      - docker build -f Dockerfile.ui --build-arg API_URL=$API_URL -t $REPOSITORY_URI:latest .
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - echo Pushing the Docker images...
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - echo Writing image definitions file...
+      - printf '[{"name":"%s","imageUri":"%s"}]' $CUSTOMER_NAME-$ENV_NAME $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+      - cat imagedefinitions.json
+      - echo Ensuring ECS service is running...
+      - ECS_CLUSTER_NAME=$(aws ecs list-clusters --query "clusterArns[?contains(@, '${CUSTOMER_NAME}')]" --output text | head -1 | awk -F/ '{print $NF}')
+      - ECS_SERVICE_NAME=$(aws ecs list-services --cluster $ECS_CLUSTER_NAME --query "serviceArns[?contains(@, 'ui')]" --output text | head -1 | awk -F/ '{print $NF}')
+      - |
+        if [ -n "$ECS_SERVICE_NAME" ]; then
+          CURRENT_COUNT=$(aws ecs describe-services --cluster $ECS_CLUSTER_NAME --services $ECS_SERVICE_NAME --query 'services[0].desiredCount' --output text)
+          if [ "$CURRENT_COUNT" = "0" ]; then
+            echo "Service at 0 tasks — scaling to 1..."
+            aws ecs update-service --cluster $ECS_CLUSTER_NAME --service $ECS_SERVICE_NAME --desired-count 1
+          fi
+        fi
+
+artifacts:
+  files:
+    - imagedefinitions.json

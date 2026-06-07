@@ -1,0 +1,12 @@
+ui/node_modules/
+ui/.next/
+__pycache__/
+*.pyc
+.git/
+.env
+node_modules/
+reports/
+sessions/
+evidence/
+*.md
+.gitignore
