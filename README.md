@@ -1,5 +1,6 @@
 # ModTester
 
+
 AI-powered penetration testing platform that lets security professionals conduct vulnerability assessments using natural language. Built on [Model Context Protocol (MCP)](https://modelcontextprotocol.io) and powered by Amazon Bedrock (Claude Opus 4.7).
 
 ModTester orchestrates 65 offensive security tools autonomously through a web UI. You describe the engagement, it executes the full kill chain — reconnaissance through reporting — and presents findings in a professional dashboard.
