@@ -60,11 +60,19 @@ FROM kalilinux/kali-rolling
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
-# Prevent postinst scripts (postgresql, systemd, metasploit-framework) from
-# trying to start/query services via systemctl/invoke-rc.d, which fails
-# inside a container with no init system and breaks the whole apt transaction.
+# Prevent postinst scripts (systemd, postgresql, metasploit-framework) from
+# touching service management during install, which fails inside a container
+# with no init system/dbus and breaks the whole apt transaction.
+# - policy-rc.d denies invoke-rc.d-based start requests.
+# - systemctl/initctl are diverted to a no-op so postinst scripts that call
+#   them directly (e.g. "systemctl is-system-running", "systemctl daemon-reload")
+#   don't fail trying to reach a dbus/systemd that doesn't exist at build time.
 RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
-    && chmod +x /usr/sbin/policy-rc.d
+    && chmod +x /usr/sbin/policy-rc.d \
+    && dpkg-divert --local --rename --add /bin/systemctl \
+    && ln -sf /bin/true /bin/systemctl \
+    && dpkg-divert --local --rename --add /sbin/initctl \
+    && ln -sf /bin/true /sbin/initctl
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv python3-dev \
