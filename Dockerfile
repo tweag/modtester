@@ -65,41 +65,31 @@ ENV LANG=C.UTF-8
 RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && chmod +x /usr/sbin/policy-rc.d
 
-# udev provides udevadm, which tpm-udev's postinst calls directly; keep it
-# installed up front so that postinst has nothing to fail on.
+# Root cause (confirmed from a full CodeBuild log, not inferred): systemd's
+# own postinst fails there with
+#   Failed to enable units: Protocol driver not attached.
+#   Cannot open '/etc/machine-id': Protocol driver not attached
+# i.e. systemd-machine-id-setup can't create/write /etc/machine-id using the
+# syscall it expects, which CodeBuild's privileged Docker-in-Docker host
+# rejects (this never reproduced in 4 local rebuilds on Docker Desktop, amd64
+# and arm64, with the same exact package list -- it's an environment-specific
+# kernel/namespace restriction, not a packaging or mirror issue). That one
+# postinst failure cascades into "dependency problems" for ssl-cert,
+# postgresql-common, udev, postgresql-18, postgresql, and
+# metasploit-framework, all configured later in the same apt transaction.
 #
-# kali-rolling resolves http.kali.org to a different mirror on every apt-get
-# update (seen in CI logs: kali.download, kali.darklab.sh, ionos, cdn-perfprod,
-# rafal.ca, ...). This install has failed in CodeBuild with "dependency
-# problems" cascading from systemd/postgresql/metasploit-framework three times,
-# each time with the dpkg state and package versions looking otherwise fine,
-# and has not reproduced across 4 clean local rebuilds (amd64 and arm64,
-# matching CodeBuild's architecture) with this exact package list. That
-# pattern -- consistent failure signature in CI, consistently clean locally --
-# points at a transient bad/out-of-sync mirror rather than a real packaging
-# conflict. Retry the whole apt-get transaction so a flaky mirror pick on one
-# attempt doesn't fail the build; a later retry re-resolves http.kali.org and
-# is likely to land on a different, healthy mirror.
-RUN set -e; \
-    ok=0; \
-    for i in 1 2 3; do \
-        if apt-get update && apt-get install -y --no-install-recommends \
-            udev \
-            python3 python3-pip python3-venv python3-dev \
-            nmap masscan netcat-openbsd whois dnsutils sslscan \
-            hydra smbclient sshpass \
-            metasploit-framework exploitdb \
-            curl wget git ca-certificates unzip jq \
-            build-essential libffi-dev libssl-dev \
-            perl libnet-ssleay-perl; \
-        then ok=1; break; \
-        else \
-            echo "apt-get install failed (attempt $i/3), repairing dpkg state and retrying..."; \
-            dpkg --configure -a || true; \
-            sleep 10; \
-        fi; \
-    done; \
-    [ "$ok" = 1 ] \
+# Pre-seed /etc/machine-id as an empty file so systemd-machine-id-setup finds
+# it already present and skips generating one, which is the standard fix for
+# this failure mode in restricted containers.
+RUN touch /etc/machine-id \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv python3-dev \
+    nmap masscan netcat-openbsd whois dnsutils sslscan \
+    hydra smbclient sshpass \
+    metasploit-framework exploitdb \
+    curl wget git ca-certificates unzip jq \
+    build-essential libffi-dev libssl-dev \
+    perl libnet-ssleay-perl \
     && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Pre-built binaries
