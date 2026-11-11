@@ -65,21 +65,41 @@ ENV LANG=C.UTF-8
 RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && chmod +x /usr/sbin/policy-rc.d
 
-# udev must be present before systemd and its dependents (postgresql,
-# metasploit-framework) install: tpm-udev's postinst calls `udevadm` directly
-# with no fallback, and dpkg has no udevadm on a minimal base image. That one
-# missing binary aborts the postinst and cascades into "dependency problems"
-# for systemd, ssl-cert, postgresql-common/18, postgresql, and
-# metasploit-framework, which all configure after it in the same transaction.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    udev \
-    python3 python3-pip python3-venv python3-dev \
-    nmap masscan netcat-openbsd whois dnsutils sslscan \
-    hydra smbclient sshpass \
-    metasploit-framework exploitdb \
-    curl wget git ca-certificates unzip jq \
-    build-essential libffi-dev libssl-dev \
-    perl libnet-ssleay-perl \
+# udev provides udevadm, which tpm-udev's postinst calls directly; keep it
+# installed up front so that postinst has nothing to fail on.
+#
+# kali-rolling resolves http.kali.org to a different mirror on every apt-get
+# update (seen in CI logs: kali.download, kali.darklab.sh, ionos, cdn-perfprod,
+# rafal.ca, ...). This install has failed in CodeBuild with "dependency
+# problems" cascading from systemd/postgresql/metasploit-framework three times,
+# each time with the dpkg state and package versions looking otherwise fine,
+# and has not reproduced across 4 clean local rebuilds (amd64 and arm64,
+# matching CodeBuild's architecture) with this exact package list. That
+# pattern -- consistent failure signature in CI, consistently clean locally --
+# points at a transient bad/out-of-sync mirror rather than a real packaging
+# conflict. Retry the whole apt-get transaction so a flaky mirror pick on one
+# attempt doesn't fail the build; a later retry re-resolves http.kali.org and
+# is likely to land on a different, healthy mirror.
+RUN set -e; \
+    ok=0; \
+    for i in 1 2 3; do \
+        if apt-get update && apt-get install -y --no-install-recommends \
+            udev \
+            python3 python3-pip python3-venv python3-dev \
+            nmap masscan netcat-openbsd whois dnsutils sslscan \
+            hydra smbclient sshpass \
+            metasploit-framework exploitdb \
+            curl wget git ca-certificates unzip jq \
+            build-essential libffi-dev libssl-dev \
+            perl libnet-ssleay-perl; \
+        then ok=1; break; \
+        else \
+            echo "apt-get install failed (attempt $i/3), repairing dpkg state and retrying..."; \
+            dpkg --configure -a || true; \
+            sleep 10; \
+        fi; \
+    done; \
+    [ "$ok" = 1 ] \
     && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Pre-built binaries
