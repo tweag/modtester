@@ -60,6 +60,12 @@ FROM kalilinux/kali-rolling
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 
+# Prevent postinst scripts (postgresql, systemd, metasploit-framework) from
+# trying to start/query services via systemctl/invoke-rc.d, which fails
+# inside a container with no init system and breaks the whole apt transaction.
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod +x /usr/sbin/policy-rc.d
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv python3-dev \
     nmap masscan netcat-openbsd whois dnsutils sslscan \
